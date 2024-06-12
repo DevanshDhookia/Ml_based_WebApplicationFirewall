@@ -1,0 +1,184 @@
+import http.server
+import http.client
+import logging
+import json
+import os
+import csv
+import ssl
+from datetime import datetime
+import hashlib  # For generating cache keys
+from http.server import ThreadingHTTPServer  # Import ThreadingHTTPServer
+import ml  # Assuming ml is the module for your machine learning functions
+
+#importing configuratins from config.json file
+def read_config(config_file):
+    with open(config_file,'r') as file:
+        config = json.load(file)
+    return config
+
+config_file = 'config.json'
+config = read_config(config_file)
+
+destinationserver = config['destination_server']
+destinationport = config['destination_port']
+proxyhost = config['host']
+proxyport = config['port']
+cert_file_path = config['cert_file_path']
+key_file_path = config['key_file_path']
+
+#for creating a log file
+log_dir = 'logs'
+
+class ReverseProxy(http.server.BaseHTTPRequestHandler):
+    threshold = 0.5  # Set your threshold here
+    cache = {}  # Cache dictionary to store responses
+
+    def handle_request(self):
+        current_time = datetime.now().strftime('%d/%b/%Y %H:%M:%S')
+
+        # Construct log message
+        log_message = f"{self.client_address[0]} - - [{current_time}] \"{self.command} {self.path} {self.request_version}\""
+        
+        # Generate a cache key based on the request details
+        cache_key = self.generate_cache_key()
+        
+        # Check if the response for this request is already in the cache
+        if cache_key in self.cache:
+            self.send_cached_response(self.cache[cache_key])
+            self.logrequest(self.client_address[0],log_message, 'Cached', 'Allowed')
+            return
+
+        # Call the ML model
+        mlresult = json.loads(ml.ml_input(log_message))
+        print("Result:", mlresult)
+
+        # Determine if the request should be allowed
+        if self.ml_response(mlresult):
+            self.forward_request(cache_key)
+            self.logrequest(self.client_address[0],log_message, mlresult, 'Allowed')
+            
+        else:
+            self.block_request(log_message)
+            self.logrequest(self.client_address[0],log_message, mlresult, 'Blocked')
+        
+    def generate_cache_key(self):
+        # Create a unique cache key from the request details
+        request_details = f"{self.command} {self.path} {self.headers}"
+        return hashlib.md5(request_details.encode()).hexdigest()
+
+    def send_cached_response(self, cached_response):
+        # Send a cached response to the client
+        self.send_response(cached_response['status'])
+        for header, value in cached_response['headers']:
+            self.send_header(header, value)
+        self.end_headers()
+        self.wfile.write(cached_response['body'])
+
+    def ml_response(self, result):
+        # Check the ML model's result to decide if the request should be blocked
+        for key in result:
+            if result[key] > self.threshold:
+                return False
+        return True
+
+    def forward_request(self, cache_key):
+        # Forward the request to the destination server
+        destination_server = destinationserver
+        destination_port = destinationport    
+
+        # Create SSL context with certificate verification disabled
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+        destination_conn = http.client.HTTPSConnection(destination_server, destination_port, context=context)
+        
+        # Read the body of the request if it exists
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length) if content_length else None
+        
+        # Forward the request to the destination server
+        destination_conn.request(self.command, self.path, body, headers=self.headers)
+        destination_response = destination_conn.getresponse()
+        
+        # Read the response from the destination server
+        response_body = destination_response.read()
+        
+        # Send the response to the client
+        self.send_response(destination_response.status)
+        headers = []
+        for header, value in destination_response.getheaders():
+            self.send_header(header, value)
+            headers.append((header, value))
+        self.end_headers()
+        self.wfile.write(response_body)
+        
+        # Cache the response
+        self.cache[cache_key] = {
+            'status': destination_response.status,
+            'headers': headers,
+            'body': response_body
+        }
+
+        destination_conn.close()
+
+
+    def block_request(self, log_message):
+        # Block the request and respond with 403 Forbidden
+        self.send_response(403)
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+        self.wfile.write(b'403 Forbidden! Your Request has been blocked as it seems suspicious')
+        logging.info(f"Request blocked by ML: {log_message}")
+
+    def logrequest(self,address,log_message, result, action):
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        log_entry = {
+            'Timestamp': datetime.now().strftime('%d/%b/%Y %H:%M:%S'),
+            'Client Address': address,
+            'Request': self.path,
+            'Result': result,
+            'Action': action
+        }
+        log_file = os.path.join(log_dir, f'proxy_logs_{current_date}.csv')
+        is_new_file = not os.path.exists(log_file)
+
+        with open(log_file, 'a', newline='') as csvfile:
+            fieldnames = ['Timestamp', 'Client Address', 'Request', 'Result', 'Action']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
+            if is_new_file:
+                writer.writeheader()
+            writer.writerow(log_entry)
+
+    def do_GET(self):
+        self.handle_request()
+
+    def do_POST(self):
+        self.handle_request()
+
+    def do_PUT(self):
+        self.handle_request()
+
+    def do_DELETE(self):
+        self.handle_request()
+
+    def do_HEAD(self):
+        self.handle_request()
+
+def run():
+    host = proxyhost
+    port = proxyport
+
+    logging.basicConfig(level=logging.INFO)
+
+    # Use ThreadingHTTPServer instead of HTTPServer
+    server = ThreadingHTTPServer((host, port), ReverseProxy)
+    logging.info(f"Starting reverse proxy server on {host}:{port}")
+    # Inside the run() function
+    server.socket = ssl.wrap_socket(server.socket, certfile=cert_file_path, keyfile=key_file_path, server_side=True)
+    
+    server.serve_forever()
+
+if __name__ == '__main__':
+    run()

@@ -1,0 +1,8 @@
+{
+    "destination_server": "192.168.64.12",
+    "destination_port": 8443,
+    "host": "127.0.0.1",
+    "port": 443,
+    "cert_file_path": "/home/devansh/Desktop/mlproxy/certs/proxy.crt",
+    "key_file_path": "/home/devansh/Desktop/mlproxy/certs/proxy.key" 
+  }
